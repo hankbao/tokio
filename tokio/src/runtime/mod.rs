@@ -31,31 +31,29 @@
 //!
 //! # Usage
 //!
-//! Most applications will use the [`run`] function. This takes a future to
-//! "seed" the application, blocking the thread until the runtime becomes
-//! [idle].
+//! Most applications will use the [`tokio::main`] attribute macro.
 //!
-//! ```rust,ignore
-//! # use futures::{Future, Stream};
-//! use tokio::net::TcpListener;
-//!
-//! # fn process<T>(_: T) -> Box<dyn Future<Item = (), Error = ()> + Send> {
-//! # unimplemented!();
-//! # }
-//! # fn dox() {
-//! # let addr = "127.0.0.1:8080".parse().unwrap();
-//! let listener = TcpListener::bind(&addr).unwrap();
-//!
-//! let server = listener.incoming()
-//!     .map_err(|e| println!("error = {:?}", e))
-//!     .for_each(|socket| {
-//!         tokio::spawn(process(socket))
-//!     });
-//!
-//! tokio::run(server);
-//! # }
-//! # pub fn main() {}
-//! ```
+/// ```
+/// #![feature(async_await)]
+///
+/// use tokio::net::TcpListener;
+///
+/// # async fn process<T>(t: T) {}
+/// # async fn dox() -> Result<(), Box<dyn std::error::Error>> {
+/// let addr = "127.0.0.1:8080".parse()?;
+/// let mut listener = TcpListener::bind(&addr).unwrap();
+///
+/// loop {
+///     let (socket, _) = listener.accept().await?;
+///
+///     tokio::spawn(async move {
+///         // Process each socket concurrently.
+///         process(socket).await
+///     });
+/// }
+/// # Ok(())
+/// # }
+/// ```
 //!
 //! In this function, the `run` function blocks until the runtime becomes idle.
 //! See [`shutdown_on_idle`][idle] for more shutdown details.
@@ -66,7 +64,7 @@
 //!
 //! A [`Runtime`] instance can also be used directly.
 //!
-//! ```rust,ignore
+//! ```
 //! # use futures::{Future, Stream};
 //! use tokio::runtime::Runtime;
 //! use tokio::net::TcpListener;

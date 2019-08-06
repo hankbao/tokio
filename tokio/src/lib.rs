@@ -29,7 +29,7 @@
 //!
 //! A simple TCP echo server:
 //!
-//! ```no_run,ignore
+//! ```no_run
 //! use tokio::prelude::*;
 //! use tokio::io::copy;
 //! use tokio::net::TcpListener;
