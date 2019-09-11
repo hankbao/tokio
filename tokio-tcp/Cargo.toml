@@ -21,9 +21,9 @@ categories = ["asynchronous"]
 
 [dependencies]
 tokio-io = "0.1.6"
-tokio-reactor = "0.1.1"
+tokio-reactor = { path = "../tokio-reactor" }
 bytes = "0.4"
-mio = "0.6.14"
+mio = { git = "https://github.com/hankbao/mio", branch = "v0.6.x-windows" }
 iovec = "0.1"
 futures = "0.1.19"
 
