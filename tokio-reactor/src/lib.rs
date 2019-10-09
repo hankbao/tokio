@@ -1,5 +1,5 @@
-#![doc(html_root_url = "https://docs.rs/tokio-reactor/0.1.9")]
-#![deny(missing_docs, warnings, missing_debug_implementations)]
+#![doc(html_root_url = "https://docs.rs/tokio-reactor/0.1.10")]
+#![deny(missing_docs, missing_debug_implementations)]
 
 //! Event loop that drives Tokio I/O resources.
 //!
@@ -631,7 +631,7 @@ impl HandlePriv {
     }
 
     unsafe fn from_usize(val: usize) -> HandlePriv {
-        let inner = mem::transmute::<usize, Weak<Inner>>(val);;
+        let inner = mem::transmute::<usize, Weak<Inner>>(val);
         HandlePriv { inner }
     }
 
