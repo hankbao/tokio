@@ -76,7 +76,7 @@ tokio-timer = { version = "0.2.8", optional = true }
 tracing-core = { version = "0.1", optional = true }
 
 # Needed until `reactor` is removed from `tokio`.
-mio = { git = "https://github.com/hankbao/mio", branch = "v0.6.x-windows", optional = true }
+mio = { git = "https://github.com/hankbao/mio.git", branch = "v0.6.x-windows", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 tokio-uds = { version = "0.2.1", optional = true }

@@ -24,7 +24,7 @@ tokio-codec = "0.1.0"
 tokio-io = "0.1.7"
 tokio-reactor = { path = "../tokio-reactor" }
 bytes = "0.4"
-mio = { git = "https://github.com/hankbao/mio", branch = "v0.6.x-windows" }
+mio = { git = "https://github.com/hankbao/mio.git", branch = "v0.6.x-windows" }
 log = "0.4"
 futures = "0.1.19"
 
