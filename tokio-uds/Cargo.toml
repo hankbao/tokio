@@ -28,7 +28,7 @@ log = "0.4.2"
 mio = { version = "0.6.21", git = "https://github.com/hankbao/mio.git", branch = "v0.6.x-windows" }
 mio-uds = "0.6.5"
 tokio-codec = "0.1.0"
-tokio-reactor = "0.1.1"
+tokio-reactor = { path = "../tokio-reactor" }
 tokio-io = "0.1.6"
 
 [dev-dependencies]

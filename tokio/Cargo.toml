@@ -79,7 +79,7 @@ tracing-core = { version = "0.1", optional = true }
 mio = { version = "0.6.21", git = "https://github.com/hankbao/mio.git", branch = "v0.6.x-windows", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-tokio-uds = { version = "0.2.1", optional = true }
+tokio-uds = { path = "../tokio-uds", optional = true }
 
 [dev-dependencies]
 env_logger = { version = "0.6", default-features = false }
