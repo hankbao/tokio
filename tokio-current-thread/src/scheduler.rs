@@ -370,6 +370,25 @@ impl fmt::Debug for Task {
     }
 }
 
+impl<U> Scheduler<U> {
+    /// Drops every item still managed by this scheduler.
+    ///
+    /// This is what dropping the `Scheduler` does; `CurrentThread::drop`
+    /// calls it explicitly so that items (and the resources they own) are
+    /// released while the executor's park handle is still alive.
+    pub fn release_all_nodes(&mut self) {
+        // Detach the list first: should an item's destructor panic, the
+        // remaining nodes are left alone (leaked) rather than released again
+        // while unwinding, which matches what happens when the loop below is
+        // interrupted inside `Drop`.
+        let mut nodes = mem::replace(&mut self.nodes, List::new());
+
+        while let Some(node) = nodes.pop_front() {
+            release_node(node);
+        }
+    }
+}
+
 fn release_node<U>(node: Arc<Node<U>>) {
     // The item is done, try to reset the queued flag. This will prevent
     // `notify` from doing any work in the item
@@ -411,9 +430,7 @@ impl<U> Drop for Scheduler<U> {
         // flying around which contain `Node` references inside them. We'll
         // let those naturally get deallocated when the `Task` itself goes out
         // of scope or gets notified.
-        while let Some(node) = self.nodes.pop_front() {
-            release_node(node);
-        }
+        self.release_all_nodes();
 
         // Note that at this point we could still have a bunch of nodes in the
         // mpsc queue. None of those nodes, however, have items associated

@@ -833,3 +833,198 @@ fn spawn_from_executor_with_handle() {
 fn ok() -> future::FutureResult<(), ()> {
     future::ok(())
 }
+
+// ===== Drop behaviour =====
+
+mod drop_behaviour {
+    use super::*;
+
+    use std::panic::{self, AssertUnwindSafe};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::Arc;
+
+    use tokio_executor::park::{Park, ParkThread, UnparkThread};
+
+    const NEVER: usize = usize::max_value();
+
+    /// Shared counters observed by the test body, the park and the futures.
+    struct Stats {
+        /// Test futures dropped so far.
+        dropped: AtomicUsize,
+        /// `park_timeout` calls so far.
+        park_timeouts: AtomicUsize,
+        /// Value of `dropped` when `park_timeout` was first called.
+        dropped_at_first_park: AtomicUsize,
+        /// Value of `dropped` when the park itself was dropped.
+        dropped_at_park_drop: AtomicUsize,
+    }
+
+    /// `ParkThread` wrapper that records how the executor uses it while
+    /// being dropped.
+    struct RecordingPark {
+        inner: ParkThread,
+        stats: Arc<Stats>,
+        panic_on_park: bool,
+    }
+
+    impl Park for RecordingPark {
+        type Unpark = UnparkThread;
+        type Error = <ParkThread as Park>::Error;
+
+        fn unpark(&self) -> UnparkThread {
+            self.inner.unpark()
+        }
+
+        fn park(&mut self) -> Result<(), Self::Error> {
+            self.inner.park()
+        }
+
+        fn park_timeout(&mut self, duration: Duration) -> Result<(), Self::Error> {
+            if self.stats.park_timeouts.fetch_add(1, SeqCst) == 0 {
+                self.stats
+                    .dropped_at_first_park
+                    .store(self.stats.dropped.load(SeqCst), SeqCst);
+            }
+            if self.panic_on_park {
+                panic!("park_timeout panicked");
+            }
+            self.inner.park_timeout(duration)
+        }
+    }
+
+    impl Drop for RecordingPark {
+        fn drop(&mut self) {
+            self.stats
+                .dropped_at_park_drop
+                .store(self.stats.dropped.load(SeqCst), SeqCst);
+        }
+    }
+
+    /// A future that never completes and counts (or panics) when dropped.
+    struct DropGuard {
+        stats: Arc<Stats>,
+        panic_msg: Option<&'static str>,
+    }
+
+    impl DropGuard {
+        fn new(stats: &Arc<Stats>) -> DropGuard {
+            DropGuard {
+                stats: stats.clone(),
+                panic_msg: None,
+            }
+        }
+
+        fn panicking(stats: &Arc<Stats>, msg: &'static str) -> DropGuard {
+            DropGuard {
+                stats: stats.clone(),
+                panic_msg: Some(msg),
+            }
+        }
+    }
+
+    impl Future for DropGuard {
+        type Item = ();
+        type Error = ();
+
+        fn poll(&mut self) -> Poll<(), ()> {
+            Ok(Async::NotReady)
+        }
+    }
+
+    impl Drop for DropGuard {
+        fn drop(&mut self) {
+            self.stats.dropped.fetch_add(1, SeqCst);
+            if let Some(msg) = self.panic_msg {
+                panic!("{}", msg);
+            }
+        }
+    }
+
+    fn recording_executor(panic_on_park: bool) -> (CurrentThread<RecordingPark>, Arc<Stats>) {
+        let stats = Arc::new(Stats {
+            dropped: AtomicUsize::new(0),
+            park_timeouts: AtomicUsize::new(0),
+            dropped_at_first_park: AtomicUsize::new(NEVER),
+            dropped_at_park_drop: AtomicUsize::new(NEVER),
+        });
+        let park = RecordingPark {
+            inner: ParkThread::new(),
+            stats: stats.clone(),
+            panic_on_park,
+        };
+        (CurrentThread::new_with_park(park), stats)
+    }
+
+    fn panic_message(err: &(dyn Any + Send)) -> &str {
+        err.downcast_ref::<String>()
+            .map(|s| s.as_str())
+            .or_else(|| err.downcast_ref::<&'static str>().map(|s| *s))
+            .expect("unexpected panic payload")
+    }
+
+    #[test]
+    fn drop_releases_all_futures_before_park() {
+        let (mut current_thread, stats) = recording_executor(false);
+
+        // One future owned by the scheduler, one still queued in the
+        // receiver (spawned through a handle outside of any task).
+        current_thread.spawn(DropGuard::new(&stats));
+        current_thread
+            .handle()
+            .spawn(DropGuard::new(&stats))
+            .unwrap();
+
+        drop(current_thread);
+
+        assert_eq!(stats.dropped.load(SeqCst), 2);
+        assert_eq!(stats.dropped_at_park_drop.load(SeqCst), 2);
+
+        if cfg!(windows) {
+            // The reactor is pumped only after every future is gone.
+            assert!(stats.park_timeouts.load(SeqCst) >= 1);
+            assert_eq!(stats.dropped_at_first_park.load(SeqCst), 2);
+        } else {
+            assert_eq!(stats.park_timeouts.load(SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn drop_idle_executor_does_not_pump() {
+        let (current_thread, stats) = recording_executor(false);
+
+        drop(current_thread);
+
+        assert_eq!(stats.park_timeouts.load(SeqCst), 0);
+        assert_eq!(stats.dropped_at_park_drop.load(SeqCst), 0);
+    }
+
+    #[test]
+    fn drop_survives_panicking_park() {
+        let (mut current_thread, stats) = recording_executor(true);
+
+        current_thread.spawn(DropGuard::new(&stats));
+
+        // Must not panic even though `park_timeout` does.
+        drop(current_thread);
+
+        assert_eq!(stats.dropped.load(SeqCst), 1);
+    }
+
+    #[test]
+    fn drop_with_panicking_receiver_future_propagates() {
+        let (current_thread, stats) = recording_executor(false);
+
+        current_thread
+            .handle()
+            .spawn(DropGuard::panicking(
+                &stats,
+                "receiver future panicked in drop",
+            ))
+            .unwrap();
+
+        let err = panic::catch_unwind(AssertUnwindSafe(move || drop(current_thread))).unwrap_err();
+
+        assert_eq!(panic_message(&*err), "receiver future panicked in drop");
+        assert_eq!(stats.dropped.load(SeqCst), 1);
+    }
+}
