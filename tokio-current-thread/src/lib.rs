@@ -54,6 +54,20 @@ use std::sync::{atomic, mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Number of times the park handle is turned when a `CurrentThread` that
+/// still had pending futures is dropped (Windows only, see `Drop`).
+///
+/// Each turn of the runtime's `Timer<Reactor>` polls the IOCP port once,
+/// which returns as soon as at least one completion packet is queued (with
+/// up to 1024 of them) or after the timeout. Four 10 ms turns therefore reap
+/// up to 4096 cancellations for a worst-case cost of 40 ms.
+#[cfg(windows)]
+const DROP_PUMP_ROUNDS: usize = 4;
+
+/// Upper bound, in milliseconds, of each of those turns.
+#[cfg(windows)]
+const DROP_PUMP_ROUND_TIMEOUT_MS: u64 = 10;
+
 /// Executes tasks on the current thread
 pub struct CurrentThread<P: Park = ParkThread> {
     /// Execute futures and receive unpark notifications.
@@ -424,12 +438,52 @@ impl<P: Park> Drop for CurrentThread<P> {
         // implemented (e.g., by setting the LSB).
         let pending = self.num_futures.fetch_add(1, atomic::Ordering::SeqCst);
 
-        // TODO: We currently ignore any pending futures at the time we shut down.
+        // Drop every pending future now, while `park` (and with it the I/O driver) is still
+        // alive, so that the resources they own can be released properly. This is exactly what
+        // dropping `scheduler` and `spawn_receiver` would do a moment later, only earlier:
+        // futures are dropped on this thread and outside of any task context, as before.
         //
-        // The "proper" fix for this is to have an explicit shutdown phase (`shutdown_on_idle`)
-        // which sets LSB (as above) do make Handle::spawn stop working, and then runs until
+        // TODO: A "proper" shutdown would be an explicit shutdown phase (`shutdown_on_idle`)
+        // which sets LSB (as above) to make Handle::spawn stop working, and then runs until
         // num_futures.load() == 1.
+        self.scheduler.release_all_nodes();
+        drop_queued_futures(&self.spawn_receiver);
+
+        // On Windows, dropping a socket with an in-flight overlapped operation only *cancels*
+        // that operation; the socket is closed once the cancellation's completion packet has
+        // been reaped from the IOCP port. Nobody would do that after `park` is gone, so give
+        // the driver a few bounded turns first. Only worth it if there were pending futures
+        // (the actual count is `>> 1`, the LSB being the shutdown flag).
+        #[cfg(windows)]
+        {
+            if pending >> 1 != 0 && !thread::panicking() {
+                for _ in 0..DROP_PUMP_ROUNDS {
+                    // Anything a racing `Handle::spawn` managed to enqueue during the previous
+                    // turn is dropped before this one so its cancellation gets reaped too.
+                    drop_queued_futures(&self.spawn_receiver);
+
+                    // Best effort: errors are ignored and a panicking park must not escape
+                    // `drop`.
+                    let park = &mut self.park;
+                    let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                        let _ =
+                            park.park_timeout(Duration::from_millis(DROP_PUMP_ROUND_TIMEOUT_MS));
+                    }));
+                }
+            }
+        }
+
+        #[cfg(not(windows))]
         let _ = pending;
+    }
+}
+
+/// Drops the futures spawned through a `Handle` that were never scheduled.
+fn drop_queued_futures(
+    receiver: &mpsc::Receiver<Box<dyn Future<Item = (), Error = ()> + Send + 'static>>,
+) {
+    for future in receiver.try_iter() {
+        drop(future);
     }
 }
 
