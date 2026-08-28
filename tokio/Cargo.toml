@@ -68,7 +68,7 @@ tokio-fs = { version = "0.1.6", optional = true }
 tokio-io = { version = "0.1.6", optional = true }
 tokio-executor = { version = "0.1.7", optional = true }
 tokio-reactor = { path = "../tokio-reactor", optional = true }
-tokio-sync = { version = "0.1.5", optional = true }
+tokio-sync = { path = "../tokio-sync", optional = true }
 tokio-threadpool = { version = "0.1.14", optional = true }
 tokio-tcp = { path = "../tokio-tcp", optional = true }
 tokio-udp = { path = "../tokio-udp", optional = true }
