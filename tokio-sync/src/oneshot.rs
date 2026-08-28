@@ -9,7 +9,8 @@ use loom::{
 use futures::{Async, Future, Poll};
 
 use std::fmt;
-use std::mem::{self, ManuallyDrop};
+use std::mem::MaybeUninit;
+use std::ptr;
 use std::sync::atomic::Ordering::{self, AcqRel, Acquire};
 use std::sync::Arc;
 
@@ -84,10 +85,10 @@ struct Inner<T> {
     value: CausalCell<Option<T>>,
 
     /// The task to notify when the receiver drops without consuming the value.
-    tx_task: CausalCell<ManuallyDrop<Task>>,
+    tx_task: CausalCell<MaybeUninit<Task>>,
 
     /// The task to notify when the value is sent.
-    rx_task: CausalCell<ManuallyDrop<Task>>,
+    rx_task: CausalCell<MaybeUninit<Task>>,
 }
 
 #[derive(Clone, Copy)]
@@ -130,8 +131,8 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let inner = Arc::new(Inner {
         state: AtomicUsize::new(State::new().as_usize()),
         value: CausalCell::new(None),
-        tx_task: CausalCell::new(ManuallyDrop::new(unsafe { mem::uninitialized() })),
-        rx_task: CausalCell::new(ManuallyDrop::new(unsafe { mem::uninitialized() })),
+        tx_task: CausalCell::new(MaybeUninit::uninit()),
+        rx_task: CausalCell::new(MaybeUninit::uninit()),
     });
 
     let tx = Sender {
@@ -192,7 +193,7 @@ impl<T> Sender<T> {
         if state.is_tx_task_set() {
             let will_notify = inner
                 .tx_task
-                .with(|ptr| unsafe { (&*ptr).will_notify_current() });
+                .with(|ptr| unsafe { (&*(*ptr).as_ptr()).will_notify_current() });
 
             if !will_notify {
                 state = State::unset_tx_task(&inner.state);
@@ -335,7 +336,8 @@ impl<T> Inner<T> {
         }
 
         if prev.is_rx_task_set() {
-            self.rx_task.with(|ptr| unsafe { (&*ptr).notify() });
+            self.rx_task
+                .with(|ptr| unsafe { (&*(*ptr).as_ptr()).notify() });
         }
 
         true
@@ -358,7 +360,7 @@ impl<T> Inner<T> {
             if state.is_rx_task_set() {
                 let will_notify = self
                     .rx_task
-                    .with(|ptr| unsafe { (&*ptr).will_notify_current() });
+                    .with(|ptr| unsafe { (&*(*ptr).as_ptr()).will_notify_current() });
 
                 // Check if the task is still the same
                 if !will_notify {
@@ -406,7 +408,8 @@ impl<T> Inner<T> {
         let prev = State::set_closed(&self.state);
 
         if prev.is_tx_task_set() && !prev.is_complete() {
-            self.tx_task.with(|ptr| unsafe { (&*ptr).notify() });
+            self.tx_task
+                .with(|ptr| unsafe { (&*(*ptr).as_ptr()).notify() });
         }
     }
 
@@ -416,21 +419,23 @@ impl<T> Inner<T> {
     }
 
     unsafe fn drop_rx_task(&self) {
-        self.rx_task.with_mut(|ptr| ManuallyDrop::drop(&mut *ptr))
+        self.rx_task
+            .with_mut(|ptr| ptr::drop_in_place((*ptr).as_mut_ptr()))
     }
 
     unsafe fn drop_tx_task(&self) {
-        self.tx_task.with_mut(|ptr| ManuallyDrop::drop(&mut *ptr))
+        self.tx_task
+            .with_mut(|ptr| ptr::drop_in_place((*ptr).as_mut_ptr()))
     }
 
     unsafe fn set_rx_task(&self) {
         self.rx_task
-            .with_mut(|ptr| *ptr = ManuallyDrop::new(task::current()));
+            .with_mut(|ptr| *ptr = MaybeUninit::new(task::current()));
     }
 
     unsafe fn set_tx_task(&self) {
         self.tx_task
-            .with_mut(|ptr| *ptr = ManuallyDrop::new(task::current()));
+            .with_mut(|ptr| *ptr = MaybeUninit::new(task::current()));
     }
 }
 
@@ -443,13 +448,13 @@ impl<T> Drop for Inner<T> {
 
         if state.is_rx_task_set() {
             self.rx_task.with_mut(|ptr| unsafe {
-                ManuallyDrop::drop(&mut *ptr);
+                ptr::drop_in_place((*ptr).as_mut_ptr());
             });
         }
 
         if state.is_tx_task_set() {
             self.tx_task.with_mut(|ptr| unsafe {
-                ManuallyDrop::drop(&mut *ptr);
+                ptr::drop_in_place((*ptr).as_mut_ptr());
             });
         }
     }
