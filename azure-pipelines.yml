@@ -82,16 +82,17 @@ jobs:
     target: i686-unknown-linux-gnu
 
 # This represents the minimum Rust version supported by
-# Tokio. Updating this should be done in a dedicated PR and
-# cannot be greater than two 0.x releases prior to the
-# current stable.
+# this fork. The Windows backend depends on the hankbao/mio
+# fork, which uses `mem::offset_of!` (stable since 1.77);
+# the tokio-sync hardening additionally needs `MaybeUninit`
+# (1.36).
 #
 # Tests are not run as tests may require newer versions of
 # rust.
 - template: ci/azure-check-minrust.yml
   parameters:
     name: minrust
-    rust_version: 1.31.0
+    rust_version: 1.77.0
 
 - template: ci/azure-tsan.yml
   parameters:
