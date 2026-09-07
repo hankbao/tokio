@@ -841,7 +841,7 @@ mod drop_behaviour {
 
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
 
     use tokio_executor::park::{Park, ParkThread, UnparkThread};
 
@@ -996,6 +996,156 @@ mod drop_behaviour {
 
         assert_eq!(stats.park_timeouts.load(SeqCst), 0);
         assert_eq!(stats.dropped_at_park_drop.load(SeqCst), 0);
+    }
+
+    #[test]
+    fn release_pending_futures_drops_them_and_shuts_handles_down() {
+        let (mut current_thread, stats) = recording_executor(false);
+        let handle = current_thread.handle();
+
+        current_thread.spawn(DropGuard::new(&stats));
+        handle.spawn(DropGuard::new(&stats)).unwrap();
+
+        assert_eq!(current_thread.release_pending_futures(), 2);
+
+        // Both the scheduled future and the one still queued in the receiver
+        // are gone, without the park handle having been turned: turning it
+        // is the caller's business from here on.
+        assert_eq!(stats.dropped.load(SeqCst), 2);
+        assert_eq!(stats.park_timeouts.load(SeqCst), 0);
+        assert!(current_thread.is_idle());
+
+        // Nothing can be spawned any more.
+        let err = handle.spawn(DropGuard::new(&stats)).unwrap_err();
+        assert!(err.is_shutdown());
+        assert_eq!(stats.dropped.load(SeqCst), 3);
+
+        // Dropping the executor afterwards skips its own pump: the caller had
+        // its turn.
+        drop(current_thread);
+
+        assert_eq!(stats.park_timeouts.load(SeqCst), 0);
+        assert_eq!(stats.dropped_at_park_drop.load(SeqCst), 3);
+    }
+
+    #[test]
+    fn release_pending_futures_is_idempotent() {
+        let (mut current_thread, stats) = recording_executor(false);
+        let handle = current_thread.handle();
+
+        current_thread.spawn(DropGuard::new(&stats));
+
+        assert_eq!(current_thread.release_pending_futures(), 1);
+
+        // A repeat call finds nothing left to drop, which is how a wrapper
+        // driving the park handle knows it can stop turning it.
+        assert_eq!(current_thread.release_pending_futures(), 0);
+        assert_eq!(current_thread.release_pending_futures(), 0);
+
+        // The shutdown flag is a bit, not a counter: releasing again must not
+        // corrupt the future count that `is_idle` and the handles read.
+        assert_eq!(stats.dropped.load(SeqCst), 1);
+        assert!(current_thread.is_idle());
+        assert!(handle
+            .spawn(DropGuard::new(&stats))
+            .unwrap_err()
+            .is_shutdown());
+
+        drop(current_thread);
+
+        assert_eq!(stats.park_timeouts.load(SeqCst), 0);
+    }
+
+    #[test]
+    fn release_pending_futures_closes_the_handle_queue_for_good() {
+        // `Handle::spawn` takes its slot in the future count and only then puts
+        // the future in the queue. A release landing between the two used to
+        // leave that future in a queue nobody looks at again: it would be
+        // dropped when the executor's fields go, that is after the caller has
+        // stopped turning the park handle, and on Windows the sockets it owned
+        // would then never be closed. The two are one operation now, so a
+        // racing spawn either gets in before the release takes the queue or is
+        // rejected outright, and a release that comes up empty is final.
+        //
+        // Every iteration below has several threads inside that window when
+        // the release happens.
+        const ITERATIONS: usize = 32;
+        const SPAWNERS: usize = 4;
+        const SPAWNS: usize = 64;
+
+        for _ in 0..ITERATIONS {
+            let (mut current_thread, stats) = recording_executor(false);
+            let handle = current_thread.handle();
+
+            let ready = Arc::new(Barrier::new(SPAWNERS + 1));
+            let spawners: Vec<_> = (0..SPAWNERS)
+                .map(|_| {
+                    let handle = handle.clone();
+                    let stats = stats.clone();
+                    let ready = ready.clone();
+                    thread::spawn(move || {
+                        ready.wait();
+                        for _ in 0..SPAWNS {
+                            // Accepted or rejected, both are fine.
+                            let _ = handle.spawn(DropGuard::new(&stats));
+                        }
+                    })
+                })
+                .collect();
+
+            ready.wait();
+            current_thread.release_pending_futures();
+
+            for spawner in spawners {
+                spawner.join().unwrap();
+            }
+
+            // Nothing was left behind: a wrapper that stopped turning its park
+            // handle on that release stranded nothing.
+            assert_eq!(current_thread.release_pending_futures(), 0);
+            assert_eq!(stats.dropped.load(SeqCst), SPAWNERS * SPAWNS);
+            assert!(current_thread.is_idle());
+        }
+    }
+
+    #[test]
+    fn drop_while_unwinding_still_releases_and_pumps() {
+        let (mut current_thread, stats) = recording_executor(false);
+
+        current_thread.spawn(DropGuard::new(&stats));
+
+        // The executor is dropped while the closure unwinds.
+        let err = panic::catch_unwind(AssertUnwindSafe(move || {
+            let _current_thread = current_thread;
+            panic!("unwinding with a live executor");
+        }))
+        .unwrap_err();
+
+        assert_eq!(panic_message(&*err), "unwinding with a live executor");
+        assert_eq!(stats.dropped.load(SeqCst), 1);
+        assert_eq!(stats.dropped_at_park_drop.load(SeqCst), 1);
+
+        if cfg!(windows) {
+            // Unwinding is no reason to leave the sockets of those futures
+            // behind: the pump runs regardless of `thread::panicking()`.
+            assert!(stats.park_timeouts.load(SeqCst) >= 1);
+            assert_eq!(stats.dropped_at_first_park.load(SeqCst), 1);
+        } else {
+            assert_eq!(stats.park_timeouts.load(SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn drop_stops_pumping_after_a_panicking_park() {
+        let (mut current_thread, stats) = recording_executor(true);
+
+        current_thread.spawn(DropGuard::new(&stats));
+
+        drop(current_thread);
+
+        // A park that panics ends the pump: it is not turned again.
+        assert!(stats.park_timeouts.load(SeqCst) <= 1);
+        assert_eq!(stats.dropped.load(SeqCst), 1);
     }
 
     #[test]

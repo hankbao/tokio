@@ -50,17 +50,24 @@ use std::cell::Cell;
 use std::error::Error;
 use std::fmt;
 use std::rc::Rc;
-use std::sync::{atomic, mpsc, Arc};
+use std::sync::{atomic, mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 /// Number of times the park handle is turned when a `CurrentThread` that
 /// still had pending futures is dropped (Windows only, see `Drop`).
 ///
-/// Each turn of the runtime's `Timer<Reactor>` polls the IOCP port once,
+/// Each turn of a `Timer<Reactor>` park handle polls the IOCP port once,
 /// which returns as soon as at least one completion packet is queued (with
-/// up to 1024 of them) or after the timeout. Four 10 ms turns therefore reap
-/// up to 4096 cancellations for a worst-case cost of 40 ms.
+/// up to 1024 of them) or after the timeout. Four turns therefore reap up to
+/// 4096 cancellations. An idle turn really takes ~16 ms rather than 10: the
+/// IOCP wait rounds the timeout up to the 15.625 ms timer granularity, so
+/// the worst case with nothing to reap is ~63 ms (measured).
+///
+/// This is only the fallback for a `CurrentThread` used on its own.
+/// `tokio::runtime::current_thread::Runtime` releases the futures itself
+/// (see `release_pending_futures`) and then turns its reactor for as long as
+/// the reactor reports operations pending, without this cap.
 #[cfg(windows)]
 const DROP_PUMP_ROUNDS: usize = 4;
 
@@ -324,6 +331,7 @@ impl<P: Park> CurrentThread<P> {
                 notify: notify,
                 shut_down: Cell::new(false),
                 thread: thread,
+                spawn_gate: Arc::new(SpawnGate::new()),
                 id,
             },
             spawn_receiver: spawn_receiver,
@@ -427,16 +435,64 @@ impl<P: Park> CurrentThread<P> {
     pub fn handle(&self) -> Handle {
         self.spawn_handle.clone()
     }
-}
 
-impl<P: Park> Drop for CurrentThread<P> {
-    fn drop(&mut self) {
-        // Signal to Handles that no more futures can be spawned by setting LSB.
+    /// Drops every future the executor still owns, without polling it again.
+    ///
+    /// This is the first thing dropping the executor does: the executor is
+    /// marked as shutting down (spawning through a [`Handle`] fails from then
+    /// on), then the futures the scheduler holds are dropped, as well as
+    /// those spawned through a `Handle` that were never picked up. Futures
+    /// are dropped on this thread, outside of any task context, while the
+    /// park handle (and with it the I/O driver a runtime places underneath
+    /// it) is still alive, so the resources they own can be released
+    /// properly.
+    ///
+    /// Calling it explicitly is only useful for a wrapper that wants to turn
+    /// the park handle *after* the futures are gone and *before* the executor
+    /// is dropped, which `Drop` cannot do on the wrapper's behalf (it does not
+    /// know what the park handle is). On Windows, that is how the
+    /// cancellations of the overlapped operations the dropped futures had in
+    /// flight get reaped, and their sockets closed; see
+    /// `tokio::runtime::current_thread::Runtime`.
+    ///
+    /// Returns how many futures *this* call dropped. A `Handle::spawn` on
+    /// another thread cannot enqueue a future once this has returned (see
+    /// `SpawnGate`), so a wrapper that keeps calling it between turns of the
+    /// park handle can treat a zero as final and stop turning: nothing else
+    /// will arrive that would need a turn. The executor reports itself idle
+    /// once released, but it is not meant to run anything else: drop it.
+    ///
+    /// [`Handle`]: struct.Handle.html
+    pub fn release_pending_futures(&mut self) -> usize {
+        self.release_pending_futures_inner().1
+    }
+
+    /// Does the work of `release_pending_futures`, returning both the number
+    /// of futures that were pending if this call was the one that released
+    /// them (`None` if an earlier call already had) and the number of futures
+    /// this call dropped.
+    fn release_pending_futures_inner(&mut self) -> (Option<usize>, usize) {
+        // Signal to Handles that no more futures can be spawned by setting LSB, and take
+        // the queue in the same breath: a `Handle::spawn` on another thread holds the
+        // gate from the moment it takes its slot in the count until its future is in the
+        // queue, so once this critical section is over the queue can never grow again.
+        // `fetch_or` keeps setting the bit idempotent: adding 1 a second time would carry
+        // into the count bits.
         //
-        // NOTE: this isn't technically necessary since the send on the mpsc will fail once the
-        // receiver is dropped, but it's useful to illustrate how clean shutdown will be
-        // implemented (e.g., by setting the LSB).
-        let pending = self.num_futures.fetch_add(1, atomic::Ordering::SeqCst);
+        // NOTE: the bit isn't technically necessary since the send on the mpsc will fail
+        // once the receiver is dropped, but it's useful to illustrate how clean shutdown
+        // will be implemented (e.g., by setting the LSB).
+        //
+        // The futures come out of the critical section undropped: running a destructor
+        // under the gate would deadlock if it happened to spawn through a `Handle` of its
+        // own. See `SpawnGate`.
+        let (previous, queued) = {
+            let _gate = self.spawn_handle.spawn_gate.enter();
+
+            let previous = self.num_futures.fetch_or(1, atomic::Ordering::SeqCst);
+
+            (previous, take_queued_futures(&self.spawn_receiver))
+        };
 
         // Drop every pending future now, while `park` (and with it the I/O driver) is still
         // alive, so that the resources they own can be released properly. This is exactly what
@@ -446,29 +502,71 @@ impl<P: Park> Drop for CurrentThread<P> {
         // TODO: A "proper" shutdown would be an explicit shutdown phase (`shutdown_on_idle`)
         // which sets LSB (as above) to make Handle::spawn stop working, and then runs until
         // num_futures.load() == 1.
-        self.scheduler.release_all_nodes();
-        drop_queued_futures(&self.spawn_receiver);
+        let dropped = queued.len();
+        drop(queued);
+
+        if previous & 1 == 1 {
+            // Already released; the queue was empty (nothing can be enqueued after the
+            // first release) unless a `Handle::spawn` had got in just before it.
+            self.discount_futures(dropped);
+            return (None, dropped);
+        }
+
+        let released = self.scheduler.release_all_nodes();
+        self.discount_futures(released + dropped);
+
+        // The actual count is `>> 1`, the LSB being the shutdown flag.
+        (Some(previous >> 1), released + dropped)
+    }
+
+    /// Takes `count` futures that have just been dropped without completing off the future
+    /// count, which only `Scheduler::tick` decrements otherwise, so that `is_idle` holds again
+    /// once everything has been released.
+    fn discount_futures(&self, count: usize) {
+        if count != 0 {
+            // NOTE: -= 2 per future since LSB is the shutdown bit. Every future that was in
+            // the scheduler or still queued in the receiver had been counted, so this cannot
+            // underflow.
+            self.num_futures.fetch_sub(2 * count, atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl<P: Park> Drop for CurrentThread<P> {
+    fn drop(&mut self) {
+        let pending = match self.release_pending_futures_inner().0 {
+            Some(pending) => pending,
+            // Released explicitly by a wrapper (see `release_pending_futures`), which has
+            // turned `park` itself since; nothing left to do here.
+            None => return,
+        };
 
         // On Windows, dropping a socket with an in-flight overlapped operation only *cancels*
         // that operation; the socket is closed once the cancellation's completion packet has
         // been reaped from the IOCP port. Nobody would do that after `park` is gone, so give
-        // the driver a few bounded turns first. Only worth it if there were pending futures
-        // (the actual count is `>> 1`, the LSB being the shutdown flag).
+        // the driver a few bounded turns first. Only worth it if there were pending futures:
+        // `CurrentThread::new()` parks a `ParkThread`, and turning that would just add tens of
+        // milliseconds of sleep to every `block_on_all` / `run` on Windows.
+        //
+        // This runs while the thread is unwinding as well: the sockets of those futures must
+        // not leak either, and each turn is contained by `catch_unwind`, so a turn that panics
+        // cannot become a double panic.
         #[cfg(windows)]
         {
-            if pending >> 1 != 0 && !thread::panicking() {
+            if pending != 0 {
+                // The release above closed the queue for good, so nothing can arrive here
+                // that would need a turn of its own (see `SpawnGate`).
                 for _ in 0..DROP_PUMP_ROUNDS {
-                    // Anything a racing `Handle::spawn` managed to enqueue during the previous
-                    // turn is dropped before this one so its cancellation gets reaped too.
-                    drop_queued_futures(&self.spawn_receiver);
-
-                    // Best effort: errors are ignored and a panicking park must not escape
-                    // `drop`.
+                    // Best effort: errors are ignored, and a park that panics must not escape
+                    // `drop`; there is no point in turning it again either.
                     let park = &mut self.park;
-                    let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    let turned = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
                         let _ =
                             park.park_timeout(Duration::from_millis(DROP_PUMP_ROUND_TIMEOUT_MS));
                     }));
+                    if turned.is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -478,13 +576,16 @@ impl<P: Park> Drop for CurrentThread<P> {
     }
 }
 
-/// Drops the futures spawned through a `Handle` that were never scheduled.
-fn drop_queued_futures(
+/// Empties the queue of futures spawned through a `Handle` that were never
+/// scheduled.
+///
+/// They are handed back rather than dropped here so that the caller can run
+/// their destructors outside the `SpawnGate` it holds while emptying the
+/// queue.
+fn take_queued_futures(
     receiver: &mpsc::Receiver<Box<dyn Future<Item = (), Error = ()> + Send + 'static>>,
-) {
-    for future in receiver.try_iter() {
-        drop(future);
-    }
+) -> Vec<Box<dyn Future<Item = (), Error = ()> + Send + 'static>> {
+    receiver.try_iter().collect()
 }
 
 impl tokio_executor::Executor for CurrentThread {
@@ -701,8 +802,51 @@ pub struct Handle {
     notify: executor::NotifyHandle,
     thread: thread::ThreadId,
 
+    /// Held by `spawn` from the moment it takes a slot in `num_futures` until
+    /// the future is in the queue, and by the executor's shutdown while it
+    /// sets the shutdown bit and takes the queue. See `SpawnGate`.
+    spawn_gate: Arc<SpawnGate>,
+
     /// The thread-local ID assigned to this Handle's executor.
     id: u64,
+}
+
+/// Makes a `Handle::spawn` from another thread and the executor's shutdown
+/// mutually exclusive.
+///
+/// `spawn` reserves its slot in `num_futures` and only then sends the future
+/// down the channel, so without this the shutdown could set its bit and take
+/// the queue in between, and the future would land in a queue that nobody
+/// looks at again -- on Windows, that means whatever the future owned is
+/// dropped after the reactor has stopped being turned, and its sockets leak.
+///
+/// Holding this across both halves of each operation makes the two orders the
+/// only possible ones: either `spawn` gets in first, and its future is in the
+/// queue before the shutdown can take it, or the shutdown gets in first, and
+/// `spawn` sees the bit and rejects the future instead of sending it. So once
+/// the shutdown's critical section is over, the queue can never grow again.
+///
+/// Futures are never *dropped* while this is held: dropping one runs a
+/// destructor that may well hold a `Handle` of its own, and taking a
+/// `std::sync::Mutex` twice on one thread deadlocks. The shutdown moves the
+/// queued futures out under the lock and drops them after releasing it, and
+/// `spawn` lets its rejected future go the same way.
+#[derive(Debug)]
+struct SpawnGate(Mutex<()>);
+
+impl SpawnGate {
+    fn new() -> SpawnGate {
+        SpawnGate(Mutex::new(()))
+    }
+
+    /// Enters the critical section. The lock guards no data, so a panic
+    /// elsewhere under it leaves nothing inconsistent behind and the poison
+    /// is ignored.
+    fn enter<'a>(&'a self) -> MutexGuard<'a, ()> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 // Manual implementation because the Sender does not implement Debug
@@ -736,24 +880,45 @@ impl Handle {
             return Err(SpawnError::shutdown());
         }
 
-        // NOTE: += 2 since LSB is the shutdown bit
-        let pending = self.num_futures.fetch_add(2, atomic::Ordering::SeqCst);
-        if pending % 2 == 1 {
-            // Bring the count back so we still know when the Runtime is idle.
-            self.num_futures.fetch_sub(2, atomic::Ordering::SeqCst);
+        // Box the future out here: the allocation has no business holding up a
+        // shutdown, and a future this call does not hand over must be dropped out here
+        // too, since its destructor may well hold a `Handle` and taking `spawn_gate`
+        // twice on one thread would deadlock.
+        let future: Box<dyn Future<Item = (), Error = ()> + Send + 'static> = Box::new(future);
 
-            // Once the Runtime is shutting down, we know it won't come back.
-            self.shut_down.set(true);
+        // Taking the slot in `num_futures` and putting the future in the queue is one
+        // operation as far as the executor's shutdown is concerned, so the future can
+        // never be left in a queue the shutdown has already taken. See `SpawnGate`.
+        let sent = {
+            let _gate = self.spawn_gate.enter();
 
-            return Err(SpawnError::shutdown());
+            // NOTE: += 2 since LSB is the shutdown bit
+            let pending = self.num_futures.fetch_add(2, atomic::Ordering::SeqCst);
+            if pending % 2 == 1 {
+                // Bring the count back so we still know when the Runtime is idle.
+                self.num_futures.fetch_sub(2, atomic::Ordering::SeqCst);
+                None
+            } else {
+                Some(self.sender.send(future))
+            }
+        };
+
+        match sent {
+            Some(Ok(())) => {
+                // use 0 for the id, CurrentThread does not make use of it
+                self.notify.notify(0);
+                Ok(())
+            }
+            // The receiver is gone. The future rode back out of the critical section
+            // inside the error and is dropped with it, here.
+            Some(Err(_)) => panic!("CurrentThread does not exist anymore"),
+            None => {
+                // Once the Runtime is shutting down, we know it won't come back.
+                self.shut_down.set(true);
+
+                Err(SpawnError::shutdown())
+            }
         }
-
-        self.sender
-            .send(Box::new(future))
-            .expect("CurrentThread does not exist anymore");
-        // use 0 for the id, CurrentThread does not make use of it
-        self.notify.notify(0);
-        Ok(())
     }
 
     /// Provides a best effort **hint** to whether or not `spawn` will succeed.
