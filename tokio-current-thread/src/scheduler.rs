@@ -376,16 +376,22 @@ impl<U> Scheduler<U> {
     /// This is what dropping the `Scheduler` does; `CurrentThread::drop`
     /// calls it explicitly so that items (and the resources they own) are
     /// released while the executor's park handle is still alive.
-    pub fn release_all_nodes(&mut self) {
+    ///
+    /// Returns the number of items released.
+    pub fn release_all_nodes(&mut self) -> usize {
         // Detach the list first: should an item's destructor panic, the
         // remaining nodes are left alone (leaked) rather than released again
         // while unwinding, which matches what happens when the loop below is
         // interrupted inside `Drop`.
         let mut nodes = mem::replace(&mut self.nodes, List::new());
+        let mut released = 0;
 
         while let Some(node) = nodes.pop_front() {
             release_node(node);
+            released += 1;
         }
+
+        released
     }
 }
 
