@@ -347,6 +347,26 @@ impl Reactor {
         self.inner.io_dispatch.read().is_empty()
     }
 
+    /// Returns the number of overlapped I/O operations that have been issued
+    /// through this reactor's completion port and whose completion no turn
+    /// has dequeued and dispatched yet.
+    ///
+    /// On Windows, dropping a socket with an operation in flight only
+    /// *cancels* that operation; the socket handle is closed when a later
+    /// turn dispatches the cancellation's completion. A runtime that is
+    /// shutting down can therefore keep turning the reactor for as long as
+    /// this is non-zero to make sure the sockets its futures owned really
+    /// get closed before the reactor is dropped.
+    ///
+    /// Only operations issued by mio's own I/O types (`mio::net`) are
+    /// counted. Operations that external users of `mio::windows::Overlapped`
+    /// issue on handles registered with this reactor (named pipes, for
+    /// instance) are not.
+    #[cfg(windows)]
+    pub fn pending_io_ops(&self) -> usize {
+        self.inner.io.pending_io_ops()
+    }
+
     /// Run this reactor on a background thread.
     ///
     /// This function takes ownership, spawns a new thread, and moves the
